@@ -27,6 +27,10 @@ if sys.platform == "win32":
 # Смещение: SteamID64 = SteamID3 + это число
 STEAM64_BASE = 76561197960265728
 
+# Таймауты
+VAC_TIMEOUT  = 5
+POST_TIMEOUT = 8
+
 
 # ============================================================
 #  ЦВЕТА КОНСОЛИ
@@ -57,12 +61,7 @@ def enable_ansi():
 # ============================================================
 
 def get_steam_path():
-    """
-    Ищет папку Steam.
-    Windows — через реестр, Linux/macOS — по типовым путям.
-    """
-    # --- Windows ---
-    if sys.platform == "win32":
+    if sys.platform == "win32": # Windows
         keys = [
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Wow6432Node\Valve\Steam"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam"),
@@ -77,8 +76,7 @@ def get_steam_path():
                 continue
         return r"C:\Program Files (x86)\Steam"
 
-    # --- Linux / macOS ---
-    home = os.path.expanduser("~")
+    home = os.path.expanduser("~") # macOS / Linux
     candidates = [
         os.path.join(home, ".steam", "steam"),
         os.path.join(home, ".local", "share", "Steam"),
@@ -116,7 +114,6 @@ def parse_loginusers(steam_path):
         with open(path, encoding="utf-8", errors="ignore") as f:
             content = f.read()
 
-        # "76561199..." { ... "AccountName" "login" ... }
         pattern = re.compile(
             r'"(7656119\d{10})"\s*\{[^}]*?"AccountName"\s*"([^"]+)"',
             re.DOTALL
@@ -154,7 +151,7 @@ def check_vac(steamid64):
     url = f"https://steamcommunity.com/profiles/{steamid64}/?xml=1"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=VAC_TIMEOUT) as r:
             data = r.read().decode("utf-8", errors="ignore")
 
         m = re.search(r"<vacBanned>(\d+)</vacBanned>", data)
@@ -168,36 +165,12 @@ def check_vac(steamid64):
 # ============================================================
 #  ПРОВЕРКА БАНОВ/МУТОВ НА ONETAKE-CS2.RU
 # ============================================================
-#
-#  Использует POST-эндпоинт /punishment/?num=1.
-#  Тело запроса: search_ban=<id>&search_mute=&search_ctban=&num=1
-#  Ответ — JSON:
-#    {
-#      "results": [
-#         {"sid": "<SteamID64 цели>", "check_getavatar": 0,
-#          "search_html": "<li>...</li>"},
-#         ...
-#      ],
-#      "total": N
-#    }
-#
-#  ВАЖНО: если искомый steamid — админ, то в результатах будут
-#  и баны НА него, и баны ОТ него. Нам нужны только записи,
-#  где sid == искомый steamid (т.е. игрок = цель наказания).
-#
-#  В search_html spans идут в порядке:
-#    [svg-иконка] [аватар] [ник цели] [причина] [срок+класс] [ник админа]
-#  Срок считается активным, если его класс содержит
-#  current_punish (временный) или permanent_punish (навсегда).
 
 _onetake_opener = None
 
 
 def _get_opener():
-    """
-    Возвращает общий opener с cookie jar.
-    Один раз делает GET на главную, чтобы DDoS-Guard выдал cookies.
-    """
+    """Opener с cookie jar + прогрев через главную страницу."""
     global _onetake_opener
     if _onetake_opener is not None:
         return _onetake_opener
@@ -207,24 +180,20 @@ def _get_opener():
         urllib.request.HTTPCookieProcessor(jar)
     )
 
-    # Разогрев: получаем cookies от DDoS-Guard
     try:
         req = urllib.request.Request(
             "https://onetake-cs2.ru/",
             headers={"User-Agent": "Mozilla/5.0"}
         )
-        _onetake_opener.open(req, timeout=10).read()
+        _onetake_opener.open(req, timeout=POST_TIMEOUT).read()
     except Exception:
         pass
 
     return _onetake_opener
 
 
-def _http_post(url, data, timeout=15):
-    """
-    POST-запрос с form-urlencoded и cookies.
-    Распаковывает gzip/deflate. Возвращает строку ответа.
-    """
+def _http_post(url, data, timeout=POST_TIMEOUT):
+    """POST-запрос с form-urlencoded и cookies + распаковка."""
     body = urllib.parse.urlencode(data).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers={
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:155.0) "
@@ -251,40 +220,30 @@ def _http_post(url, data, timeout=15):
 
 
 def _extract_punish_info(html):
-    """
-    Из HTML одного <li> вытаскивает данные наказания.
-    Возвращает {nick, reason, duration, admin, active}.
-    """
+    """Из HTML одного <li> вытаскивает данные наказания."""
     info = {"nick": "", "reason": "", "duration": "",
             "admin": "", "active": False}
 
-    # Активен, если у срока класс current_punish или permanent_punish
     if "current_punish" in html or "permanent_punish" in html:
         info["active"] = True
 
-    # Все "простые" <span>текст</span> — без вложенных тегов.
-    # Именно так отсеиваются span'ы с иконкой и аватаркой.
     plain = re.findall(r'<span[^>]*>([^<]+)</span>', html)
     plain = [s.strip() for s in plain if s.strip()]
 
     if len(plain) >= 1:
-        info["nick"] = plain[0]        # ник цели
+        info["nick"] = plain[0]
     if len(plain) >= 2:
-        info["reason"] = plain[1]      # причина
+        info["reason"] = plain[1]
     if len(plain) >= 3:
-        info["duration"] = plain[2]    # срок (напр. "Навсегда", "59 мин.")
+        info["duration"] = plain[2]
     if len(plain) >= 4:
-        info["admin"] = plain[3]       # ник админа
+        info["admin"] = plain[3]
 
     return info
 
 
 def _query_punishments(steamid64, kind="ban", page=1):
-    """
-    Отправляет POST на /punishment/ и возвращает распарсенный JSON.
-    kind: 'ban' | 'mute' | 'ctban'
-    Возвращает dict или None при ошибке.
-    """
+    """POST на /punishment/ → распарсенный JSON или None."""
     url = f"https://onetake-cs2.ru/punishment/?num={page}"
     data = {
         "search_ban":   steamid64 if kind == "ban"   else "",
@@ -300,15 +259,10 @@ def _query_punishments(steamid64, kind="ban", page=1):
 
 
 def check_onetake(steamid64):
-    """
-    Проверяет баны и муты на onetake-cs2.ru через /punishment/.
-    Возвращает {'status', 'bans', 'mutes'}.
-    status: 'Да' | 'Нет' | '?' (не удалось получить ответ)
-    """
+    """Проверяет баны и муты на onetake-cs2.ru."""
     result = {"status": "?", "bans": [], "mutes": []}
     got_response = False
 
-    # Отдельно запрашиваем баны и муты — эндпоинт ищет по разным полям
     for kind, key in (("ban", "bans"), ("mute", "mutes")):
         data = _query_punishments(steamid64, kind, page=1)
         if data is None:
@@ -316,12 +270,8 @@ def check_onetake(steamid64):
         got_response = True
 
         for item in data.get("results", []):
-            # Нам нужны только те записи, где цель = наш игрок.
-            # Записи, где наш игрок — админ (выдал бан другому),
-            # имеют sid другого человека.
             if item.get("sid") != steamid64:
                 continue
-
             info = _extract_punish_info(item.get("search_html", ""))
             result[key].append(info)
 
@@ -399,6 +349,17 @@ def export_txt(accounts, path):
 #  ВЫВОД В КОНСОЛЬ
 # ============================================================
 
+def _fmt_cell(value):
+    """Красит ячейку VAC/ONETAKE в зависимости от значения."""
+    if value == "Да":
+        return f"{C.RED}Да{C.RESET}"
+    if value == "Нет":
+        return f"{C.GREEN}Нет{C.RESET}"
+    if value == "?":
+        return f"{C.YELLOW}?{C.RESET}"
+    return f"{C.GRAY}—{C.RESET}"     # "—" = не проверялось
+
+
 def print_table(accounts):
     """Печатает таблицу аккаунтов и краткую статистику."""
     print(f"{C.BOLD}{'№':<4}{'SteamID64':<20}{'Логин':<22}"
@@ -410,26 +371,16 @@ def print_table(accounts):
 
     for i, a in enumerate(accounts, 1):
         if a["vac"] == "Да":
-            vac_disp = f"{C.RED}Да{C.RESET}"
             vac_count += 1
-        elif a["vac"] == "Нет":
-            vac_disp = f"{C.GREEN}Нет{C.RESET}"
-        else:
-            vac_disp = f"{C.YELLOW}?{C.RESET}"
-
         if a["onetake"] == "Да":
-            ot_disp = f"{C.RED}Да{C.RESET}"
             onetake_count += 1
-        elif a["onetake"] == "Нет":
-            ot_disp = f"{C.GREEN}Нет{C.RESET}"
-        else:
-            ot_disp = f"{C.YELLOW}?{C.RESET}"
 
         login = a["login"][:21]
         persona = a["persona"][:24]
 
         print(f"{i:<4}{a['steamid64']:<20}{login:<22}"
-              f"{persona:<25}{vac_disp:<16}{ot_disp}")
+              f"{persona:<25}{_fmt_cell(a['vac']):<16}"
+              f"{_fmt_cell(a['onetake'])}")
 
     print()
     print(f"  Всего: {C.BOLD}{len(accounts)}{C.RESET}  |  "
@@ -437,15 +388,16 @@ def print_table(accounts):
           f"ONETAKE: {C.RED}{onetake_count}{C.RESET}\n")
 
 
-def print_details(accounts):
-    """Печатает детали активных банов/мутов ONETAKE."""
-    banned = [a for a in accounts if a["onetake"] == "Да"]
+def print_details(accounts): # Показывает активные баны просканированных аккаунтов
+    banned = [(i, a) for i, a in enumerate(accounts, 1)
+              if a["onetake"] == "Да"]
     if not banned:
         return
 
     print(f"{C.RED}{C.BOLD}Активные наказания ONETAKE:{C.RESET}\n")
-    for a in banned:
-        print(f"  {C.BOLD}[{a['steamid64']}] {a['persona']} / "
+    for num, a in banned:
+        print(f"  {C.CYAN}№{num}{C.RESET}  "
+              f"{C.BOLD}[{a['steamid64']}] {a['persona']} / "
               f"{a['login']}{C.RESET}")
 
         info = a["onetake_info"]
@@ -466,8 +418,29 @@ def print_details(accounts):
 #  МЕНЮ
 # ============================================================
 
-def menu(accounts):
-    """Меню после сбора: открыть профиль или экспортировать."""
+def ask_scan_mode(): # Выбор режима сканирования
+    print(f"  {C.BOLD}Выберите режим сканирования:{C.RESET}")
+    print(f"  {C.CYAN}1{C.RESET} — Скан VAC + ONETAKE")
+    print(f"  {C.CYAN}2{C.RESET} — Скан VAC")
+    print(f"  {C.CYAN}3{C.RESET} — Скан ONETAKE")
+    print(f"  {C.CYAN}4{C.RESET} — Без сканирования")
+    print()
+
+    try:
+        choice = input("  Выбор [1]: ").strip() or "1"
+    except EOFError:
+        choice = "1"
+
+    if choice == "2":
+        return (True, False)
+    if choice == "3":
+        return (False, True)
+    if choice == "4":
+        return (False, False)
+    return (True, True)     # 1 и любой невалидный ввод
+
+
+def menu(accounts): # Меню, отображается после завершения сканирования
     while True:
         print(f"  {C.CYAN}1{C.RESET} — Открыть профиль ONETAKE")
         print(f"  {C.CYAN}2{C.RESET} — Экспорт на рабочий стол")
@@ -502,7 +475,7 @@ def menu(accounts):
         if choice == "2":
             path = os.path.join(
                 get_desktop(),
-                f"steam_accounts_"
+                f"ONETAKE_results_"
                 f"{datetime.datetime.now():%Y%m%d_%H%M%S}.txt"
             )
             if export_txt(accounts, path):
@@ -513,7 +486,7 @@ def menu(accounts):
 
 
 # ============================================================
-#  MAIN
+#  Основная часть скрипта
 # ============================================================
 
 def main():
@@ -525,10 +498,12 @@ def main():
         except Exception:
             pass
 
-    print(f"\n{C.CYAN}{C.BOLD}ONETAKE Account Manager{C.RESET}\n")
+    print(f"\n{C.CYAN}{C.BOLD}# ONETAKE Account Checker v1.0{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}# by Mikhailus & GraffXs{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}# https://github.com/ImGreyCat/ONETAKE-AccountChecker{C.RESET}\n")
 
     steam_path = get_steam_path()
-    print(f"  Steam: {steam_path}\n")
+    print(f"  Папка со Steam: {steam_path}")
 
     userdata = os.path.join(steam_path, "userdata")
     if not os.path.isdir(userdata):
@@ -536,8 +511,6 @@ def main():
         input("  Enter...")
         return
 
-    # Папки = SteamID3. Папку "0" пропускаем — это служебный кэш Steam,
-    # иначе получится псевдо-ID 76561197960265728.
     account_map = parse_loginusers(steam_path)
     folders = [
         f for f in sorted(os.listdir(userdata))
@@ -547,34 +520,96 @@ def main():
     ]
 
     if not folders:
-        print(f"{C.YELLOW}  Аккаунтов не найдено{C.RESET}")
+        print(f"{C.YELLOW}  Аккаунтов не найдено!{C.RESET}")
         input("  Enter...")
         return
 
-    print(f"  Найдено аккаунтов: {len(folders)}. Проверка...\n")
+    print(f"  Найдено аккаунтов: {len(folders)}\n")
 
+    # --- Меню выбора режима сканирования ---
+    do_vac, do_onetake = ask_scan_mode()
+
+    if do_vac and do_onetake:
+        mode_name = "VAC + ONETAKE"
+    elif do_vac:
+        mode_name = "VAC"
+    elif do_onetake:
+        mode_name = "ONETAKE"
+    else:
+        mode_name = "без сканирования"
+
+    print(f"  Режим: {C.BOLD}{mode_name}{C.RESET}\n")
+
+    # --- Сбор данных ---
     accounts = []
-    for i, sid3 in enumerate(folders, 1):
-        sid64 = steam3_to_steam64(sid3)
 
-        print(f"  [{i}/{len(folders)}] {sid64}...", end="\r")
+    if not (do_vac or do_onetake):
+        # Ничего не сканируем — просто собираем базовую инфу
+        for sid3 in folders:
+            accounts.append({
+                "steamid64":    steam3_to_steam64(sid3),
+                "login":        account_map.get(sid3, "—"),
+                "persona":      get_persona_name(steam_path, sid3),
+                "vac":          "—",
+                "onetake":      "—",
+                "onetake_info": {"status": "—", "bans": [], "mutes": []},
+            })
+        scan_time_total = 0.0
+        scan_time_avg = 0.0
+    else:
+        _progress_len = 0
 
-        info = check_onetake(sid64)
-        accounts.append({
-            "steamid64":    sid64,
-            "login":        account_map.get(sid3, "Неизвестно"),
-            "persona":      get_persona_name(steam_path, sid3),
-            "vac":          check_vac(sid64),
-            "onetake":      info["status"],
-            "onetake_info": info,
-        })
+        def show_progress(cur, total):
+            nonlocal _progress_len
+            text = f"  Проверка... ({cur}/{total})"
+            pad = max(_progress_len, len(text))
+            sys.stdout.write("\r" + text.ljust(pad))
+            sys.stdout.flush()
+            _progress_len = len(text)
 
-        time.sleep(0.3)  # пауза, чтобы не злить DDoS-Guard
+        scan_start = time.time()
+        for i, sid3 in enumerate(folders, 1):
+            show_progress(i, len(folders))
 
-    print(" " * 50, end="\r\n")
+            sid64 = steam3_to_steam64(sid3)
 
+            if do_onetake:
+                info = check_onetake(sid64)
+                onetake_status = info["status"]
+            else:
+                info = {"status": "—", "bans": [], "mutes": []}
+                onetake_status = "—"
+
+            vac_status = check_vac(sid64) if do_vac else "—"
+
+            accounts.append({
+                "steamid64":    sid64,
+                "login":        account_map.get(sid3, "—"),
+                "persona":      get_persona_name(steam_path, sid3),
+                "vac":          vac_status,
+                "onetake":      onetake_status,
+                "onetake_info": info,
+            })
+
+            time.sleep(0.3)
+
+        scan_time_total = time.time() - scan_start
+        scan_time_avg = scan_time_total / len(folders) if folders else 0.0
+
+        show_progress(len(folders), len(folders))
+        print()
+
+    # --- Итоги ---
+    print()
     print_table(accounts)
     print_details(accounts)
+
+    if not (do_vac or do_onetake):
+        print(f"  {C.GRAY}Сканирование не выполнялось.{C.RESET}\n")
+    else:
+        print(f"  Время сканирования: {C.BOLD}{scan_time_total:.2f} сек{C.RESET}")
+        print(f"  В среднем на аккаунт: {C.BOLD}{scan_time_avg:.2f} сек{C.RESET}\n")
+
     menu(accounts)
 
 
@@ -582,5 +617,5 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n  Прервано.")
+        print("\n  Сканирование прервано пользователем.")
         sys.exit(0)
