@@ -494,7 +494,7 @@ def main():
 
     if sys.platform == "win32":
         try:
-            ctypes.windll.kernel32.SetConsoleTitleW("ONETAKE Manager")
+            ctypes.windll.kernel32.SetConsoleTitleW("ONETAKE Account Checker")
         except Exception:
             pass
 
